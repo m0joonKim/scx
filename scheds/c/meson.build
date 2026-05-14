@@ -1,5 +1,9 @@
 c_scheds = ['scx_simple', 'scx_qmap', 'scx_central', 'scx_userland', 'scx_nest',
-            'scx_flatcg', 'scx_pair', 'scx_prev', 'scx_cf_simple', 'scx_rdb_probe']
+            'scx_flatcg', 'scx_pair', 'scx_prev', 'scx_cf_simple', 'scx_rdb_probe',
+            'scx_flush_prio', 'scx_flush_compaction_prio', 'scx_l0_compaction_prio',
+            'scx_memtable_flush_prio', 'scx_adaptive_bg_prio', 'scx_adaptive_bg_prio_v2',
+            'scx_adaptive_bg_prio_v3', 'scx_adaptive_bg_prio_v4',
+            'scx_compaction_add_flush_prio']
 
 c_scheds_lib = ['scx_sdt']
 
