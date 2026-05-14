@@ -106,11 +106,19 @@ struct {
 	__uint(max_entries, 1);
 } last_bg_decision_map SEC(".maps");
 
+/* Must match RocksDB-side exported value layout (16 bytes). */
+struct scx_thread_class_value {
+	u32 class_id;
+	s32 start_level;
+	s32 output_level;
+	u32 pad;
+};
+
 /* Reuses externally pinned map path by map name. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__type(key, u32);   /* tid */
-	__type(value, u32); /* class id */
+	__type(key, u32); /* tid */
+	__type(value, struct scx_thread_class_value);
 	__uint(max_entries, 65536);
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 } rocksdb_scx_thread_class_map SEC(".maps");
@@ -243,7 +251,7 @@ void BPF_STRUCT_OPS(rdb_probe_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u32 tid = p->pid;
 	u32 tgid = p->tgid;
-	u32 *class_id;
+	struct scx_thread_class_value *tcls;
 	struct rocksdb_scx_db_metrics *dbm;
 	u32 class_val = 0;
 	u32 stall_val = 0;
@@ -254,11 +262,11 @@ void BPF_STRUCT_OPS(rdb_probe_enqueue, struct task_struct *p, u64 enq_flags)
 
 	stat_inc(STAT_GLOBAL);
 
-	class_id = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
+	tcls = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
 	dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
-	if (class_id) {
+	if (tcls) {
 		has_class = true;
-		class_val = *class_id;
+		class_val = tcls->class_id;
 	}
 	if (dbm) {
 		has_db = true;
@@ -271,17 +279,16 @@ void BPF_STRUCT_OPS(rdb_probe_enqueue, struct task_struct *p, u64 enq_flags)
 				      DECISION_EVENT_ENQUEUE);
 
 	if (has_class) {
+		stat_inc(STAT_TID_HIT);
 		if (class_val == BG_FLUSH_CLASS)
 			stat_inc(STAT_CLASS_FLUSH);
 		else if (class_val == BG_COMPACTION_CLASS)
 			stat_inc(STAT_CLASS_COMPACTION);
 	}
-	if (has_class && has_db)
-		stat_inc(STAT_BOTH_HIT);
-	if (has_class)
-		stat_inc(STAT_TID_HIT);
 	if (has_db)
 		stat_inc(STAT_PID_HIT);
+	if (has_class && has_db)
+		stat_inc(STAT_BOTH_HIT);
 
 	is_bg = has_class && is_bg_class(class_val);
 	if (is_bg && has_db &&
@@ -342,12 +349,12 @@ void BPF_STRUCT_OPS(rdb_probe_running, struct task_struct *p)
 {
 	u32 cpu = bpf_get_smp_processor_id();
 	u32 tid = p->pid;
-	u32 *class_id;
+	struct scx_thread_class_value *tcls;
 	u32 class_val = 0;
 
-	class_id = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
-	if (class_id && is_bg_class(*class_id))
-		class_val = *class_id;
+	tcls = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
+	if (tcls && is_bg_class(tcls->class_id))
+		class_val = tcls->class_id;
 	if (cpu < MAX_TRACK_CPUS)
 		bpf_map_update_elem(&cpu_bg_class_map, &cpu, &class_val, BPF_ANY);
 
@@ -364,7 +371,7 @@ void BPF_STRUCT_OPS(rdb_probe_stopping, struct task_struct *p, bool runnable)
 	u32 zero = 0;
 	u32 tid = p->pid;
 	u32 tgid = p->tgid;
-	u32 *class_id;
+	struct scx_thread_class_value *tcls;
 	struct rocksdb_scx_db_metrics *dbm;
 	u32 class_val = 0;
 	u32 stall_val = 0;
@@ -374,25 +381,17 @@ void BPF_STRUCT_OPS(rdb_probe_stopping, struct task_struct *p, bool runnable)
 	if (cpu < MAX_TRACK_CPUS)
 		bpf_map_update_elem(&cpu_bg_class_map, &cpu, &zero, BPF_ANY);
 
-	class_id = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
+	tcls = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
 	dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
 
-	if (class_id) {
+	if (tcls) {
 		has_class = true;
-		class_val = *class_id;
-		stat_inc(STAT_TID_HIT);
-		if (class_val == BG_FLUSH_CLASS)
-			stat_inc(STAT_CLASS_FLUSH);
-		else if (class_val == BG_COMPACTION_CLASS)
-			stat_inc(STAT_CLASS_COMPACTION);
+		class_val = tcls->class_id;
 	}
 
 	if (dbm) {
 		has_db = true;
 		stall_val = dbm->stall_flag;
-		stat_inc(STAT_PID_HIT);
-		if (stall_val)
-			stat_inc(STAT_STALL);
 	}
 
 	if (!fifo_sched) {
@@ -412,7 +411,7 @@ void BPF_STRUCT_OPS(rdb_probe_stopping, struct task_struct *p, bool runnable)
 		p->scx.dsq_vtime += charge / div;
 	}
 
-	if (class_id && dbm)
+	if (has_class && has_db)
 		stat_inc(STAT_BOTH_HIT);
 
 	if (has_class)

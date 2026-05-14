@@ -19,6 +19,12 @@
 #define THREAD_CLASS_MAP_PATH_DFL "/sys/fs/bpf/rocksdb_scx_thread_class_map"
 #define DB_METRICS_MAP_PATH_ENV "ROCKSDB_SCX_DB_METRICS_MAP_PATH"
 #define DB_METRICS_MAP_PATH_DFL "/sys/fs/bpf/rocksdb_scx_db_metrics_map"
+#define BG_BOOST_SLICE_US_DFL 40000
+#define BG_SUPER_BOOST_SLICE_US_DFL 120000
+#define BG_L0_FILES_THR_DFL 16
+#define BG_DEBT_THR_DFL (512ULL << 20)
+#define BG_BOOST_VTIME_DIV_DFL 4
+#define BG_SUPER_VTIME_DIV_DFL 8
 
 #define BG_FLUSH_CLASS 1
 #define BG_COMPACTION_CLASS 2
@@ -66,9 +72,14 @@ struct last_decision {
 const char help_fmt[] =
 "Probe scheduler that validates RocksDB SCX map reads from BPF.\n"
 "\n"
-"Usage: %s [-f] [-v]\n"
+"Usage: %s [-f] [-P] [-S BOOST_US] [-T SUPER_US] [-L L0_THR] [-D DEBT_THR] [-v]\n"
 "\n"
 "  -f            Use FIFO scheduling instead of weighted vtime scheduling\n"
+"  -P            Enable draft BG boost policy (flush/compaction preempt + long slice)\n"
+"  -S BOOST_US   BG boost slice in usec (default 40000)\n"
+"  -T SUPER_US   BG super-boost slice in usec (default 120000)\n"
+"  -L L0_THR     Super-boost threshold: l0_files >= L0_THR (default 16)\n"
+"  -D DEBT_THR   Super-boost threshold: debt_bytes >= DEBT_THR (default 536870912)\n"
 "  -v            Print libbpf debug messages\n"
 "  -h            Display this help and exit\n";
 
@@ -223,6 +234,12 @@ enum stat_idx {
 	STAT_CLASS_FLUSH,
 	STAT_CLASS_COMPACTION,
 	STAT_STALL,
+	STAT_BG_BOOST_ENQ,
+	STAT_BG_SUPER_BOOST_ENQ,
+	STAT_BG_PREEMPT_DIRECT,
+	STAT_BG_PREEMPT_FAIL,
+	STAT_BG_BOOST_DSQ,
+	STAT_BG_PREEMPT_BLOCKED,
 	STAT_MAX,
 };
 
@@ -262,10 +279,33 @@ int main(int argc, char **argv)
 restart:
 	skel = SCX_OPS_OPEN(rdb_probe_ops, scx_rdb_probe);
 
-	while ((opt = getopt(argc, argv, "fvh")) != -1) {
+	skel->rodata->bg_boost_enabled = false;
+	skel->rodata->bg_boost_slice_ns = BG_BOOST_SLICE_US_DFL * 1000ULL;
+	skel->rodata->bg_super_boost_slice_ns = BG_SUPER_BOOST_SLICE_US_DFL * 1000ULL;
+	skel->rodata->bg_l0_files_thr = BG_L0_FILES_THR_DFL;
+	skel->rodata->bg_debt_thr = BG_DEBT_THR_DFL;
+	skel->rodata->bg_boost_vtime_div = BG_BOOST_VTIME_DIV_DFL;
+	skel->rodata->bg_super_vtime_div = BG_SUPER_VTIME_DIV_DFL;
+
+	while ((opt = getopt(argc, argv, "fPS:T:L:D:vh")) != -1) {
 		switch (opt) {
 		case 'f':
 			skel->rodata->fifo_sched = true;
+			break;
+		case 'P':
+			skel->rodata->bg_boost_enabled = true;
+			break;
+		case 'S':
+			skel->rodata->bg_boost_slice_ns = strtoull(optarg, NULL, 0) * 1000ULL;
+			break;
+		case 'T':
+			skel->rodata->bg_super_boost_slice_ns = strtoull(optarg, NULL, 0) * 1000ULL;
+			break;
+		case 'L':
+			skel->rodata->bg_l0_files_thr = strtoull(optarg, NULL, 0);
+			break;
+		case 'D':
+			skel->rodata->bg_debt_thr = strtoull(optarg, NULL, 0);
 			break;
 		case 'v':
 			verbose = true;
@@ -290,6 +330,13 @@ restart:
 
 	fprintf(stderr, "[scx_rdb_probe] using maps: thread=%s db=%s\n",
 		thread_class_map_path, db_metrics_map_path);
+	fprintf(stderr,
+		"[scx_rdb_probe] bg_boost=%u boost_us=%llu super_us=%llu l0_thr=%llu debt_thr=%llu\n",
+		skel->rodata->bg_boost_enabled ? 1U : 0U,
+		skel->rodata->bg_boost_slice_ns / 1000ULL,
+		skel->rodata->bg_super_boost_slice_ns / 1000ULL,
+		(unsigned long long)skel->rodata->bg_l0_files_thr,
+		(unsigned long long)skel->rodata->bg_debt_thr);
 
 	SCX_OPS_LOAD(skel, rdb_probe_ops, scx_rdb_probe, uei);
 	link = SCX_OPS_ATTACH(skel, rdb_probe_ops, scx_rdb_probe);
@@ -314,11 +361,12 @@ restart:
 			last_age_ms = (now_ns - last_bg.ts_ns) / 1000000ULL;
 
 		if (dbmap.found) {
-			printf("local=%llu global=%llu tid_hit=%llu pid_hit=%llu both=%llu "
-			       "flush=%llu compaction=%llu stall=%llu | "
-			       "thread_map(total=%llu f=%llu c=%llu o=%llu) | "
-			       "db_map(entries=%u pid=%u l0=%llu debt=%llu stall=%u age_ms=%llu) | "
-			       "last_bg(ev=%s tid=%u tgid=%u class=%s(%u) has_db=%u stall=%u age_ms=%llu)\n",
+				printf("local=%llu global=%llu tid_hit=%llu pid_hit=%llu both=%llu "
+				       "flush=%llu compaction=%llu stall=%llu "
+				       "boost=%llu super=%llu preempt=%llu prefail=%llu pblock=%llu boost_dsq=%llu | "
+				       "thread_map(total=%llu f=%llu c=%llu o=%llu) | "
+				       "db_map(entries=%u pid=%u l0=%llu debt=%llu stall=%u age_ms=%llu) | "
+				       "last_bg(ev=%s tid=%u tgid=%u class=%s(%u) has_db=%u stall=%u age_ms=%llu)\n",
 			       stats[STAT_LOCAL],
 			       stats[STAT_GLOBAL],
 			       stats[STAT_TID_HIT],
@@ -327,6 +375,12 @@ restart:
 			       stats[STAT_CLASS_FLUSH],
 			       stats[STAT_CLASS_COMPACTION],
 			       stats[STAT_STALL],
+			       stats[STAT_BG_BOOST_ENQ],
+			       stats[STAT_BG_SUPER_BOOST_ENQ],
+			       stats[STAT_BG_PREEMPT_DIRECT],
+			       stats[STAT_BG_PREEMPT_FAIL],
+			       stats[STAT_BG_PREEMPT_BLOCKED],
+			       stats[STAT_BG_BOOST_DSQ],
 			       tmap.total,
 			       tmap.flush,
 			       tmap.compaction,
@@ -346,11 +400,12 @@ restart:
 			       last_bg.stall_flag,
 			       last_age_ms);
 		} else {
-			printf("local=%llu global=%llu tid_hit=%llu pid_hit=%llu both=%llu "
-			       "flush=%llu compaction=%llu stall=%llu | "
-			       "thread_map(total=%llu f=%llu c=%llu o=%llu) | "
-			       "db_map(entries=0) | "
-			       "last_bg(ev=%s tid=%u tgid=%u class=%s(%u) has_db=%u stall=%u age_ms=%llu)\n",
+				printf("local=%llu global=%llu tid_hit=%llu pid_hit=%llu both=%llu "
+				       "flush=%llu compaction=%llu stall=%llu "
+				       "boost=%llu super=%llu preempt=%llu prefail=%llu pblock=%llu boost_dsq=%llu | "
+				       "thread_map(total=%llu f=%llu c=%llu o=%llu) | "
+				       "db_map(entries=0) | "
+				       "last_bg(ev=%s tid=%u tgid=%u class=%s(%u) has_db=%u stall=%u age_ms=%llu)\n",
 			       stats[STAT_LOCAL],
 			       stats[STAT_GLOBAL],
 			       stats[STAT_TID_HIT],
@@ -359,6 +414,12 @@ restart:
 			       stats[STAT_CLASS_FLUSH],
 			       stats[STAT_CLASS_COMPACTION],
 			       stats[STAT_STALL],
+			       stats[STAT_BG_BOOST_ENQ],
+			       stats[STAT_BG_SUPER_BOOST_ENQ],
+			       stats[STAT_BG_PREEMPT_DIRECT],
+			       stats[STAT_BG_PREEMPT_FAIL],
+			       stats[STAT_BG_PREEMPT_BLOCKED],
+			       stats[STAT_BG_BOOST_DSQ],
 			       tmap.total,
 			       tmap.flush,
 			       tmap.compaction,
