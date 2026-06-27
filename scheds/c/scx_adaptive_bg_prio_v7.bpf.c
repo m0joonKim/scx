@@ -1,31 +1,161 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * scx_adaptive_bg_prio v4
+ * scx_adaptive_bg_prio v7
  *
- * Core change from v1: FLUSH_DSQ and L0_DSQ are merged into one BG_PRIO_DSQ.
+ * ─────────────────────────────────────────────────────────────────────
+ * v6 → v7 변경점 — 최소 변경
+ * ─────────────────────────────────────────────────────────────────────
  *
- * v1 problem: vtime bonus only orders tasks within the same DSQ.
- * Since flush lived in FLUSH_DSQ and L0 in L0_DSQ, and dispatch always
- * consumed FLUSH_DSQ first, the per-DSQ vtime bonuses had no effect on
- * the flush-vs-L0 CPU allocation.
+ * [배경 / 동기]
+ * v6 측정 결과:
+ *   - fillrandom: deeper-comp의 debt_bytes가 임계값 부근에서 진동 → v6의
+ *     3단계 동적 정책(SHARED / COMP / BG_PRIO)이 골고루 활성화.
+ *   - YCSB workload A: debt_bytes가 거의 0 → v6가 사실상 항상 v5 모드
+ *     (deeper-comp → SHARED). debt 기반 dynamic switching의 효과 미미.
  *
- * v4 fix: put both flush and L0 compaction threads into a single
- * BG_PRIO_DSQ with vtime ordering.  Each thread's vtime is set to:
+ * 분석: deeper-comp는 v6의 3-tier로 잘 처리되지만, L0 compaction은
+ *   - v5/v6: l0_files < l0_thr → SHARED   (writer와 fair)
+ *   - v5/v6: l0_files >= l0_thr → BG_PRIO (vtime bonus)
+ *   2단계뿐. 임계 도달 순간 binary jump → oscillation 가능성.
+ *
+ * [v7 변경]
+ *   L0 compaction에도 v6와 같은 3-tier 적용 — soft/hard 두 임계값:
+ *
+ *     l0_files >= l0_thr_hard  → TASK_CLS_L0   → BG_PRIO_DSQ  (긴급)
+ *     l0_files >= l0_thr_soft  → TASK_CLS_COMP → COMP_DSQ     (선제적)
+ *     l0_files <  l0_thr_soft  → TASK_CLS_NONE → SHARED_DSQ   (fair)
+ *
+ *   기존 `-k` 파라미터는 hard 임계값으로 유지(default 8 = slowdown_trigger).
+ *   신규 `-j` 파라미터로 soft 임계값 설정(default 4 = file_num_compaction_trigger).
+ *   `-j 0`이면 soft=hard로 동작 (v6 호환 모드).
+ *
+ * [기대 효과]
+ *   - L0 백로그 형성 시 binary jump 대신 선제적 catch-up
+ *   - 사용자 직관 "미리 처리 / slowdown 도달 / stop 도달" 3단계와 일치
+ *   - deeper-comp는 v6 동일 (debt 기반)
+ *   - flush는 v5/v6 동일 (memtable 기반)
+ *
+ * [위험 / 한계]
+ *   - YCSB 같이 l0_files 자체가 낮은 워크로드에는 영향 미미
+ *     (여전히 SHARED) → workload-agnostic 보장 못 함
+ *   - soft/hard gap이 좁으면 oscillation 가능
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * (이하 v6 원문)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * v5 → v6 변경점
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * [배경]
+ * v5 측정 결과:
+ *   - stall 빈도 v4 대비 97% 감소 (24521 → 4847 events)
+ *   - 그러나 개별 stall duration 5x 증가 (avg 7.7ms → 37ms)
+ *   - **total stall time 거의 동일** (189s → 180s)
+ *   → "frequent small stall" 을 "rare massive stall" 로 amortize한 것뿐.
+ *      LSM compaction 빚은 미루기만 할 뿐 사라지지 않음.
+ *
+ * [v6 가설]
+ *   deeper-level compaction을 항상 양보(v5)도, 항상 우선(v4)도 정답 아님.
+ *   debt_bytes (pending compaction bytes, RocksDB 자체 metric) 따라
+ *   동적 switching:
+ *
+ *     debt < soft_thr           → v5 동작 (SHARED_DSQ, fair with writer)
+ *     soft_thr ≤ debt < hard_thr → v4 동작 (COMP_DSQ, writer보다 우선)
+ *     debt ≥ hard_thr           → 긴급 (BG_PRIO_DSQ, vtime bonus)
+ *
+ *   이 자체조절 동작으로:
+ *     - 평소: writer 보호 (v5 장점 유지)
+ *     - 백로그 누적 시: 미리 catch-up 시작 (massive stall 방지)
+ *     - 극단: 폭발 직전 긴급 drain
+ *
+ * [구현 위치]
+ *   classify_task() 의 BG_COMPACTION_CLASS branch (start_level != 0) 만 변경.
+ *   L0 compaction과 flush는 v5와 동일.
+ *
+ * [신규 파라미터]
+ *   debt_soft_thr_bytes (-D, default 256 MB)
+ *   debt_hard_thr_bytes (-H, default 1 GB)
+ *
+ * [위험 / 한계]
+ *   - Hysteresis 없음 — debt 임계값 근처에서 모드 흔들림 가능
+ *     완화: soft/hard 갭을 충분히 (256MB ↔ 1GB)
+ *   - debt_bytes update 주기(3초)만큼 반응 지연
+ *   - 임계값 튜닝 sensitivity 큼 — sweep 측정 필요
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * (이하 v5 원문 — v5의 비대칭 제거 설계는 v6에서도 그대로 유지됨)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * v4 → v5 변경점
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * [배경]
+ * v4 multi-instance 측정 결과:
+ *   - write p99 latency: 100배 개선 (1.1ms → 9µs)
+ *   - throughput: +13~20%
+ *   - 그러나 p99.9 / p99.99 latency가 base CFS 대비 2~5배 악화
+ *
+ * 가설 검증 (per-event stall duration + non-stall avg latency 분석):
+ *   (A) 큰 backlog 가설 확인:
+ *       v4는 stall 빈도를 82% 감소시키지만 개별 stall duration은
+ *       3~5배 길어짐 (avg 2ms → 6ms, p99 5ms → 26ms).
+ *   (B) Writer starvation 확인:
+ *       정상(비-stall) 시기에도 writer의 non-stall avg latency가
+ *       base 대비 1.5~2배 증가 (8µs → 14~17µs).
+ *
+ * [v4 코드 분석으로 드러난 비대칭]
+ *   classify_task() 구조:
+ *     - Flush:   pressure 없으면 TASK_CLS_NONE → SHARED_DSQ (writer와 동등) ✓
+ *     - L0 comp: pressure 없으면 TASK_CLS_COMP → COMP_DSQ (writer보다 우선) ✗
+ *     - L1+ comp: pressure 조건 자체 없음 → 항상 COMP_DSQ → 항상 writer보다 우선 ✗
+ *
+ *   Dispatch 순서가 BG_PRIO_DSQ > COMP_DSQ > SHARED_DSQ 이므로
+ *   COMP_DSQ 안의 모든 compaction은 압력과 무관하게 writer를 밀어냄.
+ *   이게 (B) writer starvation의 구조적 원인.
+ *
+ * [v5 변경]
+ *   비대칭 제거 — L0 compaction도 flush와 같은 방식으로 분기,
+ *   deeper-level compaction은 항상 writer와 동등:
+ *
+ *     - L0 compaction (start_level == 0):
+ *         l0_files >= l0_thr  → TASK_CLS_L0   → BG_PRIO_DSQ  (기존과 동일)
+ *         l0_files <  l0_thr  → TASK_CLS_NONE → SHARED_DSQ   (변경: COMP → NONE)
+ *
+ *     - Deeper compaction (start_level != 0):
+ *         항상 TASK_CLS_NONE → SHARED_DSQ                    (변경: 항상 COMP → NONE)
+ *
+ *   결과적으로 TASK_CLS_COMP / COMP_DSQ 는 더 이상 enqueue되지 않지만
+ *   metrics_miss / stale fallback 경로 호환을 위해 큐 정의와 dispatch
+ *   로직은 그대로 유지함.
+ *
+ * [기대 효과]
+ *   - 압력 없는 시기 writer가 deeper-level compaction과 fair share
+ *     → non-stall latency 회복 (가설 B 완화)
+ *   - 압력 발생 시 기존 vtime bonus 로직은 그대로 동작
+ *     → stall 빈도 유지 (p99 효과 유지)
+ *   - 예상 부작용: deeper-level compaction 진행 속도 다소 감소 →
+ *     장기 write amplification 증가 가능. fillrandom 단기 벤치엔 영향 미미.
+ *
+ * ─────────────────────────────────────────────────────────────────────
+ * (v4 원문 설명 — vtime 메커니즘은 그대로 유지)
+ * ─────────────────────────────────────────────────────────────────────
+ *
+ * flush와 L0 compaction 두 BG thread를 BG_PRIO_DSQ에 함께 넣고
+ * vtime ordering으로 dispatch. 각 thread의 vtime은:
  *
  *   vtime = vtime_now - BG_BONUS_BASE × pressure_ratio / 100
  *
- * where pressure_ratio reflects how far the relevant metric exceeds its
- * threshold (capped at MAX_PRESSURE_PCT=300%).
- *
- * When flush pressure is higher than L0 pressure the flush thread gets a
- * lower vtime → dispatched more often.  When L0 pressure dominates the L0
- * compaction thread wins.  The CPU allocation automatically tracks which
- * bottleneck is more urgent.
+ * pressure_ratio는 해당 metric이 threshold를 얼마나 초과했는지로 계산
+ * (MAX_PRESSURE_PCT=300%로 cap). flush pressure > L0 pressure이면 flush가
+ * 더 자주 dispatch, 반대면 L0가 우선.
  *
  * Dispatch order: BG_PRIO_DSQ (vtime) > COMP_DSQ (FIFO) > SHARED_DSQ (FIFO)
  *
- * Preemption: flush and L0 threads can preempt COMP/SHARED (CPU_PRIO_NONE)
- * but not each other (CPU_PRIO_BG_PRIO).
+ * Preemption: flush/L0 thread는 COMP/SHARED(CPU_PRIO_NONE)를 preempt할 수
+ * 있으나, 서로(CPU_PRIO_BG_PRIO)는 preempt하지 않음.
  */
 #include <scx/common.bpf.h>
 
@@ -40,7 +170,11 @@ const volatile u64 metrics_max_age_ns;
 const volatile u64 wait_safety_ns;
 const volatile u64 memtable_bytes_thr;
 const volatile u64 imm_memtables_thr;
-const volatile u64 l0_files_thr;
+const volatile u64 l0_files_thr;          /* v7: hard threshold (BG_PRIO) */
+const volatile u64 l0_files_thr_soft;     /* v7: soft threshold (COMP); 0 disables */
+/* v6: dynamic deeper-compaction switching thresholds (bytes) */
+const volatile u64 debt_soft_thr_bytes;
+const volatile u64 debt_hard_thr_bytes;
 
 static u64 vtime_now;
 UEI_DEFINE(uei);
@@ -179,7 +313,11 @@ static __always_inline u32 classify_task(struct task_struct *p)
 	struct scx_db_metrics_value *dbm;
 	u64 bytes_thr = memtable_bytes_thr ? : (64ULL << 20);
 	u64 imm_thr   = imm_memtables_thr;  /* 0 = always activate flush */
-	u64 l0_thr    = l0_files_thr ? : 4;
+	u64 l0_hard   = l0_files_thr ? : 4;
+	/* v7: soft 임계값. 0 이면 hard와 동일 (v6 호환). */
+	u64 l0_soft   = l0_files_thr_soft ? : l0_hard;
+	u64 debt_soft = debt_soft_thr_bytes ? : (256ULL << 20);  /* 256 MB */
+	u64 debt_hard = debt_hard_thr_bytes ? : (1024ULL << 20); /* 1 GB */
 
 	tcls = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
 	if (!tcls) {
@@ -207,19 +345,49 @@ static __always_inline u32 classify_task(struct task_struct *p)
 
 	if (tcls->class_id == BG_COMPACTION_CLASS) {
 		if (tcls->start_level == 0) {
+			/*
+			 * v7: L0 compaction 3-tier.
+			 *   l0 < soft        → SHARED (writer fair)
+			 *   soft ≤ l0 < hard → COMP (선제적, writer 위)
+			 *   l0 ≥ hard        → BG_PRIO (긴급, vtime bonus)
+			 */
 			dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
 			if (!dbm) {
 				stat_inc(STAT_METRICS_MISS);
-				return TASK_CLS_COMP;
+				return TASK_CLS_NONE;
 			}
 			if (metrics_is_stale(dbm)) {
 				stat_inc(STAT_METRICS_STALE);
-				return TASK_CLS_COMP;
+				return TASK_CLS_NONE;
 			}
-			if (dbm->l0_files >= l0_thr)
+			if (dbm->l0_files >= l0_hard)
 				return TASK_CLS_L0;
+			if (dbm->l0_files >= l0_soft)
+				return TASK_CLS_COMP;
+			return TASK_CLS_NONE;
 		}
-		return TASK_CLS_COMP;
+
+		/*
+		 * v6: deeper-level compaction (start_level != 0) — debt_bytes
+		 * 기반 3단계 동적 분류.
+		 *   debt < soft  → SHARED (v5 동작, writer fair)
+		 *   soft ≤ debt < hard → COMP (v4 동작, writer 위)
+		 *   debt ≥ hard  → BG_PRIO (긴급 drain, vtime bonus)
+		 */
+		dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
+		if (!dbm) {
+			stat_inc(STAT_METRICS_MISS);
+			return TASK_CLS_NONE;
+		}
+		if (metrics_is_stale(dbm)) {
+			stat_inc(STAT_METRICS_STALE);
+			return TASK_CLS_NONE;
+		}
+		if (dbm->debt_bytes >= debt_hard)
+			return TASK_CLS_L0;       /* BG_PRIO_DSQ + vtime bonus */
+		if (dbm->debt_bytes >= debt_soft)
+			return TASK_CLS_COMP;     /* COMP_DSQ (writer 위) */
+		return TASK_CLS_NONE;         /* SHARED_DSQ (fair) */
 	}
 
 	return TASK_CLS_NONE;
@@ -233,7 +401,10 @@ static __always_inline u32 classify_task_nostat(struct task_struct *p)
 	struct scx_db_metrics_value *dbm;
 	u64 bytes_thr = memtable_bytes_thr ? : (64ULL << 20);
 	u64 imm_thr   = imm_memtables_thr;  /* 0 = always activate flush */
-	u64 l0_thr    = l0_files_thr ? : 4;
+	u64 l0_hard   = l0_files_thr ? : 4;
+	u64 l0_soft   = l0_files_thr_soft ? : l0_hard;
+	u64 debt_soft = debt_soft_thr_bytes ? : (256ULL << 20);
+	u64 debt_hard = debt_hard_thr_bytes ? : (1024ULL << 20);
 
 	tcls = bpf_map_lookup_elem(&rocksdb_scx_thread_class_map, &tid);
 	if (!tcls)
@@ -253,13 +424,25 @@ static __always_inline u32 classify_task_nostat(struct task_struct *p)
 
 	if (tcls->class_id == BG_COMPACTION_CLASS) {
 		if (tcls->start_level == 0) {
+			/* v7: L0 3-tier (soft/hard) */
 			dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
 			if (!dbm || metrics_is_stale(dbm))
-				return TASK_CLS_COMP;
-			if (dbm->l0_files >= l0_thr)
+				return TASK_CLS_NONE;
+			if (dbm->l0_files >= l0_hard)
 				return TASK_CLS_L0;
+			if (dbm->l0_files >= l0_soft)
+				return TASK_CLS_COMP;
+			return TASK_CLS_NONE;
 		}
-		return TASK_CLS_COMP;
+		/* v6: deeper compaction debt-based 3-tier */
+		dbm = bpf_map_lookup_elem(&rocksdb_scx_db_metrics_map, &tgid);
+		if (!dbm || metrics_is_stale(dbm))
+			return TASK_CLS_NONE;
+		if (dbm->debt_bytes >= debt_hard)
+			return TASK_CLS_L0;
+		if (dbm->debt_bytes >= debt_soft)
+			return TASK_CLS_COMP;
+		return TASK_CLS_NONE;
 	}
 
 	return TASK_CLS_NONE;
@@ -406,7 +589,7 @@ static __always_inline s32 try_bg_prio_preempt_dispatch(struct task_struct *p,
 	return PRIO_DISPATCH_FAIL;
 }
 
-s32 BPF_STRUCT_OPS(adaptive_bg_prio_v4_select_cpu, struct task_struct *p,
+s32 BPF_STRUCT_OPS(adaptive_bg_prio_v7_select_cpu, struct task_struct *p,
 		   s32 prev_cpu, u64 wake_flags)
 {
 	bool is_idle = false;
@@ -420,7 +603,7 @@ s32 BPF_STRUCT_OPS(adaptive_bg_prio_v4_select_cpu, struct task_struct *p,
 	return cpu;
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_enqueue, struct task_struct *p, u64 enq_flags)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	u32 cls = classify_task(p);
 	u64 f_slice = flush_slice_ns  ? : 120000000ULL;
@@ -521,7 +704,7 @@ static __always_inline bool try_rescue_shared(s32 cpu)
 	return false;
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_dispatch, s32 cpu, struct task_struct *prev)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_dispatch, s32 cpu, struct task_struct *prev)
 {
 	if (scx_bpf_dsq_move_to_local(BG_PRIO_DSQ))
 		return;
@@ -535,7 +718,7 @@ void BPF_STRUCT_OPS(adaptive_bg_prio_v4_dispatch, s32 cpu, struct task_struct *p
 	scx_bpf_dsq_move_to_local(SHARED_DSQ);
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_running, struct task_struct *p)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_running, struct task_struct *p)
 {
 	u32 cpu = bpf_get_smp_processor_id();
 	u32 cls = classify_task_nostat(p);
@@ -556,7 +739,7 @@ void BPF_STRUCT_OPS(adaptive_bg_prio_v4_running, struct task_struct *p)
 		vtime_now = p->scx.dsq_vtime;
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_stopping, struct task_struct *p, bool runnable)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_stopping, struct task_struct *p, bool runnable)
 {
 	u32 cpu = bpf_get_smp_processor_id();
 	u32 zero = 0;
@@ -572,12 +755,12 @@ void BPF_STRUCT_OPS(adaptive_bg_prio_v4_stopping, struct task_struct *p, bool ru
 		p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_enable, struct task_struct *p)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_enable, struct task_struct *p)
 {
 	p->scx.dsq_vtime = vtime_now;
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(adaptive_bg_prio_v4_init)
+s32 BPF_STRUCT_OPS_SLEEPABLE(adaptive_bg_prio_v7_init)
 {
 	s32 ret;
 
@@ -590,18 +773,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(adaptive_bg_prio_v4_init)
 	return scx_bpf_create_dsq(BG_PRIO_DSQ, -1);
 }
 
-void BPF_STRUCT_OPS(adaptive_bg_prio_v4_exit, struct scx_exit_info *ei)
+void BPF_STRUCT_OPS(adaptive_bg_prio_v7_exit, struct scx_exit_info *ei)
 {
 	UEI_RECORD(uei, ei);
 }
 
-SCX_OPS_DEFINE(adaptive_bg_prio_v4_ops,
-	       .select_cpu = (void *)adaptive_bg_prio_v4_select_cpu,
-	       .enqueue    = (void *)adaptive_bg_prio_v4_enqueue,
-	       .dispatch   = (void *)adaptive_bg_prio_v4_dispatch,
-	       .running    = (void *)adaptive_bg_prio_v4_running,
-	       .stopping   = (void *)adaptive_bg_prio_v4_stopping,
-	       .enable     = (void *)adaptive_bg_prio_v4_enable,
-	       .init       = (void *)adaptive_bg_prio_v4_init,
-	       .exit       = (void *)adaptive_bg_prio_v4_exit,
-	       .name       = "adaptive_bg_prio_v4");
+SCX_OPS_DEFINE(adaptive_bg_prio_v7_ops,
+	       .select_cpu = (void *)adaptive_bg_prio_v7_select_cpu,
+	       .enqueue    = (void *)adaptive_bg_prio_v7_enqueue,
+	       .dispatch   = (void *)adaptive_bg_prio_v7_dispatch,
+	       .running    = (void *)adaptive_bg_prio_v7_running,
+	       .stopping   = (void *)adaptive_bg_prio_v7_stopping,
+	       .enable     = (void *)adaptive_bg_prio_v7_enable,
+	       .init       = (void *)adaptive_bg_prio_v7_init,
+	       .exit       = (void *)adaptive_bg_prio_v7_exit,
+	       .name       = "adaptive_bg_prio_v7");
